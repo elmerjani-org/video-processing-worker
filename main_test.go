@@ -70,6 +70,143 @@ func TestJobMessageValidate(t *testing.T) {
 	}
 }
 
+func TestJobMessageFromSQSBody(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		body           string
+		fallbackBucket string
+		want           JobMessage
+		wantErr        string
+	}{
+		{
+			name: "custom job message still works",
+			body: `{
+				"jobId":"job-1",
+				"bucket":"videos",
+				"sourceS3Key":"uploads/job-1/input.mov",
+				"outputS3Key":"outputs/job-1/master.m3u8",
+				"thumbnailS3Key":"thumbnails/job-1.jpg"
+			}`,
+			want: JobMessage{
+				JobID:          "job-1",
+				Bucket:         "videos",
+				SourceS3Key:    "uploads/job-1/input.mov",
+				OutputS3Key:    "outputs/job-1/master.m3u8",
+				ThumbnailS3Key: "thumbnails/job-1.jpg",
+			},
+		},
+		{
+			name: "custom job message uses fallback bucket",
+			body: `{
+				"jobId":"job-1",
+				"sourceS3Key":"uploads/job-1/input.mov",
+				"outputS3Key":"outputs/job-1/master.m3u8",
+				"thumbnailS3Key":"thumbnails/job-1.jpg"
+			}`,
+			fallbackBucket: "fallback-videos",
+			want: JobMessage{
+				JobID:          "job-1",
+				Bucket:         "fallback-videos",
+				SourceS3Key:    "uploads/job-1/input.mov",
+				OutputS3Key:    "outputs/job-1/master.m3u8",
+				ThumbnailS3Key: "thumbnails/job-1.jpg",
+			},
+		},
+		{
+			name: "s3 upload event becomes job message",
+			body: `{
+				"Records": [{
+					"eventSource": "aws:s3",
+					"s3": {
+						"bucket": {"name": "videos"},
+						"object": {"key": "uploads%2Fjob-1%2Fclip+1.mp4"}
+					}
+				}]
+			}`,
+			want: JobMessage{
+				JobID:          "job-1",
+				Bucket:         "videos",
+				SourceS3Key:    "uploads/job-1/clip 1.mp4",
+				OutputS3Key:    "outputs/job-1/master.m3u8",
+				ThumbnailS3Key: "thumbnails/job-1.jpg",
+			},
+		},
+		{
+			name: "s3 output event is ignored",
+			body: `{
+				"Records": [{
+					"eventSource": "aws:s3",
+					"s3": {
+						"bucket": {"name": "videos"},
+						"object": {"key": "outputs%2Fjob-1%2Fmaster.m3u8"}
+					}
+				}]
+			}`,
+			wantErr: "S3 event has no uploads/ object record",
+		},
+		{
+			name:    "s3 test event is ignored",
+			body:    `{"Service":"Amazon S3","Event":"s3:TestEvent"}`,
+			wantErr: "S3 event has no uploads/ object record",
+		},
+		{
+			name:    "invalid json",
+			body:    "{not-json",
+			wantErr: "bad message JSON:",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := jobMessageFromSQSBody(tt.body, tt.fallbackBucket)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("jobMessageFromSQSBody() error = %v, want nil", err)
+				}
+				if got != tt.want {
+					t.Fatalf("jobMessageFromSQSBody() = %#v, want %#v", got, tt.want)
+				}
+				return
+			}
+
+			if err == nil {
+				t.Fatal("jobMessageFromSQSBody() error = nil, want error")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("jobMessageFromSQSBody() error = %q, want containing %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestJobIDFromUploadKey(t *testing.T) {
+	t.Parallel()
+
+	got, err := jobIDFromUploadKey("uploads/123/source.mp4")
+	if err != nil {
+		t.Fatalf("jobIDFromUploadKey() error = %v, want nil", err)
+	}
+	if got != "123" {
+		t.Fatalf("jobIDFromUploadKey() = %q, want 123", got)
+	}
+
+	for _, key := range []string{"uploads/", "uploads/job-only", "outputs/123/source.mp4"} {
+		key := key
+		t.Run(key, func(t *testing.T) {
+			t.Parallel()
+
+			if _, err := jobIDFromUploadKey(key); err == nil {
+				t.Fatal("jobIDFromUploadKey() error = nil, want error")
+			}
+		})
+	}
+}
+
 func TestHandleMessagePermanentValidationErrors(t *testing.T) {
 	t.Parallel()
 

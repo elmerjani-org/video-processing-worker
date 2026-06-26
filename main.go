@@ -52,6 +52,22 @@ type JobMessage struct {
 	ThumbnailS3Key string `json:"thumbnailS3Key"`
 }
 
+type s3EventNotification struct {
+	Records []s3EventRecord `json:"Records"`
+}
+
+type s3EventRecord struct {
+	EventSource string `json:"eventSource"`
+	S3          struct {
+		Bucket struct {
+			Name string `json:"name"`
+		} `json:"bucket"`
+		Object struct {
+			Key string `json:"key"`
+		} `json:"object"`
+	} `json:"s3"`
+}
+
 type permanentError struct {
 	err error
 }
@@ -146,10 +162,10 @@ func main() {
 				var permanent permanentError
 				if errors.As(err, &permanent) {
 					log.Printf("permanent job failure: %v", err)
-					shouldDelete = markFailedFromMessage(ctx, db, *msg.Body, err)
+					shouldDelete = markFailedFromMessage(ctx, db, cfg.VideoBucket, *msg.Body, err)
 				} else if receiveCount >= cfg.MaxReceiveCount {
 					log.Printf("job failed after %d receives: %v", receiveCount, err)
-					shouldDelete = markFailedFromMessage(ctx, db, *msg.Body, err)
+					shouldDelete = markFailedFromMessage(ctx, db, cfg.VideoBucket, *msg.Body, err)
 				} else {
 					log.Printf("job failed, leaving message for retry receive_count=%d: %v", receiveCount, err)
 				}
@@ -185,15 +201,8 @@ func loadConfig() Config {
 }
 
 func handleMessage(ctx context.Context, cfg Config, db *sql.DB, s3Client *s3.Client, body string) error {
-	var jm JobMessage
-	if err := json.Unmarshal([]byte(body), &jm); err != nil {
-		return permanentError{err: fmt.Errorf("bad message JSON: %w", err)}
-	}
-
-	if jm.Bucket == "" {
-		jm.Bucket = cfg.VideoBucket
-	}
-	if err := jm.validate(); err != nil {
+	jm, err := jobMessageFromSQSBody(body, cfg.VideoBucket)
+	if err != nil {
 		return permanentError{err: err}
 	}
 
@@ -272,6 +281,84 @@ func (m JobMessage) validate() error {
 		return fmt.Errorf("message missing required fields: %s", strings.Join(missing, ", "))
 	}
 	return nil
+}
+
+func jobMessageFromSQSBody(body, fallbackBucket string) (JobMessage, error) {
+	var jm JobMessage
+	if err := json.Unmarshal([]byte(body), &jm); err != nil {
+		return JobMessage{}, fmt.Errorf("bad message JSON: %w", err)
+	}
+
+	if jm.hasCustomJobFields() {
+		if jm.Bucket == "" {
+			jm.Bucket = fallbackBucket
+		}
+		if err := jm.validate(); err != nil {
+			return JobMessage{}, err
+		}
+		return jm, nil
+	}
+
+	var event s3EventNotification
+	if err := json.Unmarshal([]byte(body), &event); err != nil {
+		return JobMessage{}, fmt.Errorf("bad S3 event JSON: %w", err)
+	}
+	return jobMessageFromS3Event(event, fallbackBucket)
+}
+
+func (m JobMessage) hasCustomJobFields() bool {
+	return m.JobID != "" ||
+		m.Bucket != "" ||
+		m.SourceS3Key != "" ||
+		m.OutputS3Key != "" ||
+		m.ThumbnailS3Key != ""
+}
+
+func jobMessageFromS3Event(event s3EventNotification, fallbackBucket string) (JobMessage, error) {
+	for _, record := range event.Records {
+		if record.EventSource != "" && record.EventSource != "aws:s3" {
+			continue
+		}
+
+		bucket := firstNonEmpty(record.S3.Bucket.Name, fallbackBucket)
+		if bucket == "" || record.S3.Object.Key == "" {
+			continue
+		}
+
+		key, err := url.QueryUnescape(record.S3.Object.Key)
+		if err != nil {
+			return JobMessage{}, fmt.Errorf("decode S3 object key: %w", err)
+		}
+		if !strings.HasPrefix(key, "uploads/") {
+			continue
+		}
+
+		jobID, err := jobIDFromUploadKey(key)
+		if err != nil {
+			return JobMessage{}, err
+		}
+		return JobMessage{
+			JobID:          jobID,
+			Bucket:         bucket,
+			SourceS3Key:    key,
+			OutputS3Key:    "outputs/" + jobID + "/master.m3u8",
+			ThumbnailS3Key: "thumbnails/" + jobID + ".jpg",
+		}, nil
+	}
+
+	return JobMessage{}, fmt.Errorf("S3 event has no uploads/ object record")
+}
+
+func jobIDFromUploadKey(key string) (string, error) {
+	if !strings.HasPrefix(key, "uploads/") {
+		return "", fmt.Errorf("S3 upload key %q must match uploads/{jobId}/{fileName}", key)
+	}
+	rest := strings.TrimPrefix(key, "uploads/")
+	parts := strings.SplitN(rest, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", fmt.Errorf("S3 upload key %q must match uploads/{jobId}/{fileName}", key)
+	}
+	return parts[0], nil
 }
 
 func openDB(ctx context.Context, cfg Config, secretsClient *secretsmanager.Client) (*sql.DB, error) {
@@ -354,13 +441,13 @@ func markCompleted(ctx context.Context, db *sql.DB, jobID, outputKey, thumbnailK
 	return err
 }
 
-func markFailedFromMessage(ctx context.Context, db *sql.DB, body string, cause error) bool {
-	var jm JobMessage
-	if err := json.Unmarshal([]byte(body), &jm); err != nil || jm.JobID == "" {
+func markFailedFromMessage(ctx context.Context, db *sql.DB, fallbackBucket, body string, cause error) bool {
+	jm, err := jobMessageFromSQSBody(body, fallbackBucket)
+	if err != nil || jm.JobID == "" {
 		return true
 	}
 
-	_, err := db.ExecContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`update video_jobs set status='FAILED', error_message=$2, updated_at=now() where id=$1`,
 		jm.JobID,
 		truncate(cause.Error(), 1900),
