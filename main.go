@@ -7,12 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
+	"math"
 	"net"
 	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
+	s3path "path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -51,6 +54,29 @@ type JobMessage struct {
 
 type permanentError struct {
 	err error
+}
+
+type VideoInfo struct {
+	Width  int
+	Height int
+}
+
+type Rendition struct {
+	Label        string
+	Width        int
+	Height       int
+	VideoBitrate string
+	MaxRate      string
+	BufferSize   string
+	AudioBitrate string
+	Bandwidth    int
+}
+
+var renditionLadder = []Rendition{
+	{Label: "360p", Height: 360, VideoBitrate: "800k", MaxRate: "856k", BufferSize: "1200k", AudioBitrate: "96k", Bandwidth: 950000},
+	{Label: "480p", Height: 480, VideoBitrate: "1400k", MaxRate: "1498k", BufferSize: "2100k", AudioBitrate: "128k", Bandwidth: 1600000},
+	{Label: "720p", Height: 720, VideoBitrate: "2800k", MaxRate: "2996k", BufferSize: "4200k", AudioBitrate: "128k", Bandwidth: 3200000},
+	{Label: "1080p", Height: 1080, VideoBitrate: "5000k", MaxRate: "5350k", BufferSize: "7500k", AudioBitrate: "192k", Bandwidth: 5500000},
 }
 
 func (e permanentError) Error() string {
@@ -194,8 +220,10 @@ func handleMessage(ctx context.Context, cfg Config, db *sql.DB, s3Client *s3.Cli
 	defer os.RemoveAll(tmpDir)
 
 	inputPath := filepath.Join(tmpDir, "input")
-	outputPath := filepath.Join(tmpDir, "output.mp4")
+	hlsDir := filepath.Join(tmpDir, "hls")
 	thumbPath := filepath.Join(tmpDir, "thumbnail.jpg")
+	masterS3Key := hlsMasterS3Key(jm)
+	hlsS3Prefix := s3path.Dir(masterS3Key)
 
 	log.Printf("downloading source job_id=%s bucket=%s key=%s", jm.JobID, jm.Bucket, jm.SourceS3Key)
 	if err := downloadFromS3(ctx, s3Client, jm.Bucket, jm.SourceS3Key, inputPath); err != nil {
@@ -203,19 +231,19 @@ func handleMessage(ctx context.Context, cfg Config, db *sql.DB, s3Client *s3.Cli
 	}
 
 	log.Printf("processing video job_id=%s", jm.JobID)
-	if err := runFFmpeg(ctx, inputPath, outputPath, thumbPath); err != nil {
+	if err := runFFmpeg(ctx, inputPath, hlsDir, thumbPath); err != nil {
 		return permanentError{err: err}
 	}
 
-	log.Printf("uploading output job_id=%s output=%s thumbnail=%s", jm.JobID, jm.OutputS3Key, jm.ThumbnailS3Key)
-	if err := uploadToS3(ctx, s3Client, jm.Bucket, jm.OutputS3Key, outputPath, "video/mp4"); err != nil {
-		return fmt.Errorf("upload output: %w", err)
+	log.Printf("uploading HLS output job_id=%s master=%s thumbnail=%s", jm.JobID, masterS3Key, jm.ThumbnailS3Key)
+	if err := uploadDirectoryToS3(ctx, s3Client, jm.Bucket, hlsDir, hlsS3Prefix); err != nil {
+		return fmt.Errorf("upload HLS output: %w", err)
 	}
 	if err := uploadToS3(ctx, s3Client, jm.Bucket, jm.ThumbnailS3Key, thumbPath, "image/jpeg"); err != nil {
 		return fmt.Errorf("upload thumbnail: %w", err)
 	}
 
-	if err := markCompleted(ctx, db, jm.JobID, jm.OutputS3Key, jm.ThumbnailS3Key); err != nil {
+	if err := markCompleted(ctx, db, jm.JobID, masterS3Key, jm.ThumbnailS3Key); err != nil {
 		return fmt.Errorf("mark completed: %w", err)
 	}
 
@@ -380,24 +408,48 @@ func uploadToS3(ctx context.Context, s3Client *s3.Client, bucket, key, path, con
 	return err
 }
 
-func runFFmpeg(ctx context.Context, inputPath, outputPath, thumbPath string) error {
-	transcode := exec.CommandContext(ctx,
-		"ffmpeg",
-		"-hide_banner",
-		"-loglevel", "warning",
-		"-y",
-		"-i", inputPath,
-		"-map", "0:v:0",
-		"-map", "0:a?",
-		"-c:v", "libx264",
-		"-preset", "veryfast",
-		"-crf", "23",
-		"-c:a", "aac",
-		"-movflags", "+faststart",
-		outputPath,
-	)
-	if out, err := transcode.CombinedOutput(); err != nil {
-		return fmt.Errorf("ffmpeg transcode failed: %w output=%s", err, truncate(string(out), 1400))
+func uploadDirectoryToS3(ctx context.Context, s3Client *s3.Client, bucket, localDir, keyPrefix string) error {
+	return filepath.WalkDir(localDir, func(localPath string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+
+		relativePath, err := filepath.Rel(localDir, localPath)
+		if err != nil {
+			return err
+		}
+
+		key := s3path.Join(keyPrefix, filepath.ToSlash(relativePath))
+		return uploadToS3(ctx, s3Client, bucket, key, localPath, contentTypeForPath(localPath))
+	})
+}
+
+func runFFmpeg(ctx context.Context, inputPath, hlsDir, thumbPath string) error {
+	info, err := probeVideo(ctx, inputPath)
+	if err != nil {
+		return err
+	}
+
+	renditions := selectRenditions(info)
+	if len(renditions) == 0 {
+		return fmt.Errorf("no renditions selected for input resolution %dx%d", info.Width, info.Height)
+	}
+
+	if err := os.MkdirAll(hlsDir, 0o755); err != nil {
+		return fmt.Errorf("create HLS directory: %w", err)
+	}
+
+	for _, rendition := range renditions {
+		if err := generateHLSRendition(ctx, inputPath, hlsDir, rendition); err != nil {
+			return err
+		}
+	}
+
+	if err := writeMasterPlaylist(filepath.Join(hlsDir, "master.m3u8"), renditions); err != nil {
+		return err
 	}
 
 	thumbnail := exec.CommandContext(ctx,
@@ -416,6 +468,184 @@ func runFFmpeg(ctx context.Context, inputPath, outputPath, thumbPath string) err
 	}
 
 	return nil
+}
+
+func probeVideo(ctx context.Context, inputPath string) (VideoInfo, error) {
+	cmd := exec.CommandContext(ctx,
+		"ffprobe",
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=width,height",
+		"-of", "json",
+		inputPath,
+	)
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return VideoInfo{}, fmt.Errorf("ffprobe failed: %w output=%s", err, truncate(string(out), 1400))
+	}
+
+	var response struct {
+		Streams []VideoInfo `json:"streams"`
+	}
+	if err := json.Unmarshal(out, &response); err != nil {
+		return VideoInfo{}, fmt.Errorf("parse ffprobe output: %w", err)
+	}
+	if len(response.Streams) == 0 || response.Streams[0].Width <= 0 || response.Streams[0].Height <= 0 {
+		return VideoInfo{}, fmt.Errorf("ffprobe did not return a valid video stream")
+	}
+
+	return response.Streams[0], nil
+}
+
+func selectRenditions(info VideoInfo) []Rendition {
+	selected := make([]Rendition, 0, len(renditionLadder))
+	for _, candidate := range renditionLadder {
+		if candidate.Height > info.Height {
+			continue
+		}
+
+		rendition := candidate
+		rendition.Width = scaledEvenWidth(info, candidate.Height)
+		selected = append(selected, rendition)
+	}
+
+	if len(selected) > 0 {
+		return selected
+	}
+
+	height := evenDown(info.Height)
+	if height < 2 {
+		height = 2
+	}
+
+	return []Rendition{
+		{
+			Label:        fmt.Sprintf("%dp", height),
+			Width:        scaledEvenWidth(info, height),
+			Height:       height,
+			VideoBitrate: "500k",
+			MaxRate:      "535k",
+			BufferSize:   "750k",
+			AudioBitrate: "96k",
+			Bandwidth:    650000,
+		},
+	}
+}
+
+func generateHLSRendition(ctx context.Context, inputPath, hlsDir string, rendition Rendition) error {
+	renditionDir := filepath.Join(hlsDir, rendition.Label)
+	if err := os.MkdirAll(renditionDir, 0o755); err != nil {
+		return fmt.Errorf("create rendition directory %s: %w", rendition.Label, err)
+	}
+
+	playlistPath := filepath.Join(renditionDir, "index.m3u8")
+	segmentPattern := filepath.Join(renditionDir, "segment_%05d.ts")
+	scaleFilter := fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease:force_divisible_by=2", rendition.Width, rendition.Height)
+
+	cmd := exec.CommandContext(ctx,
+		"ffmpeg",
+		"-hide_banner",
+		"-loglevel", "warning",
+		"-y",
+		"-i", inputPath,
+		"-map", "0:v:0",
+		"-map", "0:a?",
+		"-vf", scaleFilter,
+		"-c:v", "libx264",
+		"-preset", "veryfast",
+		"-profile:v", "main",
+		"-crf", "23",
+		"-b:v", rendition.VideoBitrate,
+		"-maxrate", rendition.MaxRate,
+		"-bufsize", rendition.BufferSize,
+		"-c:a", "aac",
+		"-b:a", rendition.AudioBitrate,
+		"-ac", "2",
+		"-hls_time", "6",
+		"-hls_playlist_type", "vod",
+		"-hls_segment_filename", segmentPattern,
+		playlistPath,
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("ffmpeg HLS %s failed: %w output=%s", rendition.Label, err, truncate(string(out), 1400))
+	}
+
+	return nil
+}
+
+func writeMasterPlaylist(path string, renditions []Rendition) error {
+	var builder strings.Builder
+	builder.WriteString("#EXTM3U\n")
+	builder.WriteString("#EXT-X-VERSION:3\n")
+
+	for _, rendition := range renditions {
+		builder.WriteString(fmt.Sprintf(
+			"#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%dx%d\n",
+			rendition.Bandwidth,
+			rendition.Width,
+			rendition.Height,
+		))
+		builder.WriteString(fmt.Sprintf("%s/index.m3u8\n", rendition.Label))
+	}
+
+	return os.WriteFile(path, []byte(builder.String()), 0o644)
+}
+
+func scaledEvenWidth(info VideoInfo, targetHeight int) int {
+	if info.Width <= 0 || info.Height <= 0 || targetHeight <= 0 {
+		return 2
+	}
+
+	width := int(math.Round(float64(info.Width) * float64(targetHeight) / float64(info.Height)))
+	return evenUp(width)
+}
+
+func evenDown(value int) int {
+	if value < 2 {
+		return 2
+	}
+	if value%2 == 0 {
+		return value
+	}
+	return value - 1
+}
+
+func evenUp(value int) int {
+	if value < 2 {
+		return 2
+	}
+	if value%2 == 0 {
+		return value
+	}
+	return value + 1
+}
+
+func hlsMasterS3Key(message JobMessage) string {
+	if strings.HasSuffix(strings.ToLower(message.OutputS3Key), ".m3u8") {
+		return message.OutputS3Key
+	}
+	if message.JobID != "" {
+		return s3path.Join("outputs", message.JobID, "master.m3u8")
+	}
+
+	outputWithoutExt := strings.TrimSuffix(message.OutputS3Key, s3path.Ext(message.OutputS3Key))
+	return s3path.Join(outputWithoutExt, "master.m3u8")
+}
+
+func contentTypeForPath(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".m3u8":
+		return "application/vnd.apple.mpegurl"
+	case ".ts":
+		return "video/mp2t"
+	case ".mp4":
+		return "video/mp4"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	default:
+		return "application/octet-stream"
+	}
 }
 
 func extendMessageVisibility(ctx context.Context, client *sqs.Client, queueURL, receiptHandle string, timeoutSeconds int32, stop <-chan struct{}) {

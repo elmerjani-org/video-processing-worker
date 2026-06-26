@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -207,5 +209,158 @@ func TestTruncate(t *testing.T) {
 	long := strings.Repeat("x", 2000)
 	if got := truncate(long, 1900); len(got) != 1900 {
 		t.Fatalf("truncate(long, 1900) length = %d, want 1900", len(got))
+	}
+}
+
+func TestSelectRenditions(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		info       VideoInfo
+		wantLabels []string
+		wantWidths []int
+	}{
+		{
+			name:       "full HD gets all variants",
+			info:       VideoInfo{Width: 1920, Height: 1080},
+			wantLabels: []string{"360p", "480p", "720p", "1080p"},
+			wantWidths: []int{640, 854, 1280, 1920},
+		},
+		{
+			name:       "720p input is not upscaled",
+			info:       VideoInfo{Width: 1280, Height: 720},
+			wantLabels: []string{"360p", "480p", "720p"},
+			wantWidths: []int{640, 854, 1280},
+		},
+		{
+			name:       "small input gets source-height variant",
+			info:       VideoInfo{Width: 426, Height: 240},
+			wantLabels: []string{"240p"},
+			wantWidths: []int{426},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := selectRenditions(tt.info)
+			if len(got) != len(tt.wantLabels) {
+				t.Fatalf("selectRenditions() length = %d, want %d: %#v", len(got), len(tt.wantLabels), got)
+			}
+
+			for i := range got {
+				if got[i].Label != tt.wantLabels[i] {
+					t.Fatalf("rendition[%d].Label = %q, want %q", i, got[i].Label, tt.wantLabels[i])
+				}
+				if got[i].Width != tt.wantWidths[i] {
+					t.Fatalf("rendition[%d].Width = %d, want %d", i, got[i].Width, tt.wantWidths[i])
+				}
+				if got[i].Height%2 != 0 || got[i].Width%2 != 0 {
+					t.Fatalf("rendition[%d] dimensions are not even: %dx%d", i, got[i].Width, got[i].Height)
+				}
+			}
+		})
+	}
+}
+
+func TestHLSMasterS3Key(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		message JobMessage
+		want    string
+	}{
+		{
+			name: "keeps playlist key from API",
+			message: JobMessage{
+				JobID:       "job-1",
+				OutputS3Key: "outputs/job-1/master.m3u8",
+			},
+			want: "outputs/job-1/master.m3u8",
+		},
+		{
+			name: "converts legacy mp4 key to job HLS prefix",
+			message: JobMessage{
+				JobID:       "job-1",
+				OutputS3Key: "outputs/job-1.mp4",
+			},
+			want: "outputs/job-1/master.m3u8",
+		},
+		{
+			name: "falls back from arbitrary output key",
+			message: JobMessage{
+				OutputS3Key: "outputs/custom.mp4",
+			},
+			want: "outputs/custom/master.m3u8",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := hlsMasterS3Key(tt.message); got != tt.want {
+				t.Fatalf("hlsMasterS3Key() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestContentTypeForPath(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]string{
+		"master.m3u8":      "application/vnd.apple.mpegurl",
+		"segment_00001.ts": "video/mp2t",
+		"output.mp4":       "video/mp4",
+		"thumbnail.jpg":    "image/jpeg",
+		"unknown.bin":      "application/octet-stream",
+	}
+
+	for path, want := range tests {
+		path := path
+		want := want
+		t.Run(path, func(t *testing.T) {
+			t.Parallel()
+
+			if got := contentTypeForPath(path); got != want {
+				t.Fatalf("contentTypeForPath(%q) = %q, want %q", path, got, want)
+			}
+		})
+	}
+}
+
+func TestWriteMasterPlaylist(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "master.m3u8")
+	renditions := []Rendition{
+		{Label: "360p", Width: 640, Height: 360, Bandwidth: 950000},
+		{Label: "720p", Width: 1280, Height: 720, Bandwidth: 3200000},
+	}
+
+	if err := writeMasterPlaylist(path, renditions); err != nil {
+		t.Fatalf("writeMasterPlaylist() error = %v", err)
+	}
+
+	gotBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read master playlist: %v", err)
+	}
+
+	got := string(gotBytes)
+	for _, want := range []string{
+		"#EXTM3U\n",
+		"#EXT-X-STREAM-INF:BANDWIDTH=950000,RESOLUTION=640x360\n360p/index.m3u8\n",
+		"#EXT-X-STREAM-INF:BANDWIDTH=3200000,RESOLUTION=1280x720\n720p/index.m3u8\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("master playlist missing %q in:\n%s", want, got)
+		}
 	}
 }
