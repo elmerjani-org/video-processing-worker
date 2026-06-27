@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"net/url"
 	"os"
@@ -11,6 +12,83 @@ import (
 
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 )
+
+type fakeResult struct {
+	rows int64
+}
+
+func (r fakeResult) LastInsertId() (int64, error) { return 0, nil }
+func (r fakeResult) RowsAffected() (int64, error) { return r.rows, nil }
+
+type recordingExecer struct {
+	query string
+	args  []any
+	rows  int64
+	err   error
+}
+
+func (e *recordingExecer) ExecContext(_ context.Context, query string, args ...any) (sql.Result, error) {
+	e.query = query
+	e.args = args
+	if e.err != nil {
+		return nil, e.err
+	}
+	return fakeResult{rows: e.rows}, nil
+}
+
+func TestClaimJob(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		rows        int64
+		wantClaimed bool
+	}{
+		{name: "wins atomic claim", rows: 1, wantClaimed: true},
+		{name: "duplicate loses atomic claim", rows: 0, wantClaimed: false},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			db := &recordingExecer{rows: tt.rows}
+			claimed, err := claimJob(context.Background(), db, "job-1", "worker-1", "claim-1", 300)
+			if err != nil {
+				t.Fatalf("claimJob() error = %v, want nil", err)
+			}
+			if claimed != tt.wantClaimed {
+				t.Fatalf("claimJob() claimed = %t, want %t", claimed, tt.wantClaimed)
+			}
+			if !strings.Contains(db.query, "status='QUEUED'") || !strings.Contains(db.query, "lease_expires_at <= now()") {
+				t.Fatalf("claimJob() query is missing atomic claim predicates: %s", db.query)
+			}
+			if len(db.args) != 4 || db.args[0] != "job-1" || db.args[1] != "worker-1" || db.args[2] != "claim-1" || db.args[3] != int32(300) {
+				t.Fatalf("claimJob() args = %#v, want job, worker, claim, lease", db.args)
+			}
+		})
+	}
+}
+
+func TestNewClaimToken(t *testing.T) {
+	t.Parallel()
+
+	first, err := newClaimToken()
+	if err != nil {
+		t.Fatalf("newClaimToken() error = %v", err)
+	}
+	second, err := newClaimToken()
+	if err != nil {
+		t.Fatalf("newClaimToken() error = %v", err)
+	}
+	if len(first) != 32 || len(second) != 32 {
+		t.Fatalf("claim token lengths = %d and %d, want 32", len(first), len(second))
+	}
+	if first == second {
+		t.Fatal("newClaimToken() returned duplicate tokens")
+	}
+}
 
 func TestJobMessageValidate(t *testing.T) {
 	t.Parallel()

@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,6 +44,7 @@ type Config struct {
 	VisibilityTimeoutSeconds int32
 	MaxReceiveCount          int
 	ReceiveWaitSeconds       int32
+	WorkerID                 string
 }
 
 type JobMessage struct {
@@ -72,6 +75,17 @@ type permanentError struct {
 	err error
 }
 
+type jobBusyError struct {
+	jobID  string
+	status string
+}
+
+type claimedJobError struct {
+	jobID      string
+	claimToken string
+	err        error
+}
+
 type VideoInfo struct {
 	Width  int
 	Height int
@@ -88,6 +102,10 @@ type Rendition struct {
 	Bandwidth    int
 }
 
+type sqlExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
 var renditionLadder = []Rendition{
 	{Label: "360p", Height: 360, VideoBitrate: "800k", MaxRate: "856k", BufferSize: "1200k", AudioBitrate: "96k", Bandwidth: 950000},
 	{Label: "480p", Height: 480, VideoBitrate: "1400k", MaxRate: "1498k", BufferSize: "2100k", AudioBitrate: "128k", Bandwidth: 1600000},
@@ -102,6 +120,13 @@ func (e permanentError) Error() string {
 func (e permanentError) Unwrap() error {
 	return e.err
 }
+
+func (e jobBusyError) Error() string {
+	return fmt.Sprintf("job %s is not claimable (status=%s)", e.jobID, e.status)
+}
+
+func (e claimedJobError) Error() string { return e.err.Error() }
+func (e claimedJobError) Unwrap() error { return e.err }
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -156,6 +181,12 @@ func main() {
 			close(stopExtender)
 
 			if err != nil {
+				var busy jobBusyError
+				if errors.As(err, &busy) {
+					log.Printf("duplicate or premature delivery; leaving message for retry: %v", err)
+					continue
+				}
+
 				receiveCount := approximateReceiveCount(msg.Attributes)
 				shouldDelete := false
 
@@ -185,6 +216,7 @@ func main() {
 }
 
 func loadConfig() Config {
+	visibilityTimeoutSeconds := int32(getenvInt("WORKER_VISIBILITY_TIMEOUT_SECONDS", 3600))
 	return Config{
 		Region:                   getenv("AWS_REGION", "us-east-1"),
 		QueueURL:                 mustGetenv("VIDEO_JOBS_QUEUE_URL"),
@@ -194,33 +226,54 @@ func loadConfig() Config {
 		DatabasePort:             getenv("DATABASE_PORT", "5432"),
 		DatabaseName:             getenv("DATABASE_NAME", "videoprocessing"),
 		DatabaseSSLMode:          getenv("DATABASE_SSLMODE", "require"),
-		VisibilityTimeoutSeconds: int32(getenvInt("WORKER_VISIBILITY_TIMEOUT_SECONDS", 3600)),
+		VisibilityTimeoutSeconds: visibilityTimeoutSeconds,
 		MaxReceiveCount:          getenvInt("WORKER_MAX_RECEIVE_COUNT", 3),
 		ReceiveWaitSeconds:       int32(getenvInt("WORKER_RECEIVE_WAIT_SECONDS", 20)),
+		WorkerID:                 getenv("WORKER_ID", defaultWorkerID()),
 	}
 }
 
-func handleMessage(ctx context.Context, cfg Config, db *sql.DB, s3Client *s3.Client, body string) error {
+func handleMessage(ctx context.Context, cfg Config, db *sql.DB, s3Client *s3.Client, body string) (retErr error) {
 	jm, err := jobMessageFromSQSBody(body, cfg.VideoBucket)
 	if err != nil {
 		return permanentError{err: err}
 	}
 
-	status, err := currentJobStatus(ctx, db, jm.JobID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return permanentError{err: fmt.Errorf("job %s not found", jm.JobID)}
+	var ownedClaimToken string
+	defer func() {
+		if retErr != nil && ownedClaimToken != "" {
+			retErr = claimedJobError{jobID: jm.JobID, claimToken: ownedClaimToken, err: retErr}
 		}
-		return fmt.Errorf("read job status: %w", err)
-	}
-	if status == "COMPLETED" {
-		log.Printf("job already completed job_id=%s", jm.JobID)
-		return nil
+	}()
+
+	claimToken, err := newClaimToken()
+	if err != nil {
+		return fmt.Errorf("generate claim token: %w", err)
 	}
 
-	if err := markProcessing(ctx, db, jm.JobID); err != nil {
-		return fmt.Errorf("mark processing: %w", err)
+	claimed, err := claimJob(ctx, db, jm.JobID, cfg.WorkerID, claimToken, cfg.VisibilityTimeoutSeconds)
+	if err != nil {
+		return fmt.Errorf("claim job: %w", err)
 	}
+	if !claimed {
+		status, err := currentJobStatus(ctx, db, jm.JobID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return permanentError{err: fmt.Errorf("job %s not found", jm.JobID)}
+			}
+			return fmt.Errorf("read unclaimed job status: %w", err)
+		}
+		if status == "COMPLETED" {
+			log.Printf("job already completed job_id=%s", jm.JobID)
+			return nil
+		}
+		return jobBusyError{jobID: jm.JobID, status: status}
+	}
+	ownedClaimToken = claimToken
+
+	stopLeaseExtender := make(chan struct{})
+	go extendJobLease(ctx, db, jm.JobID, claimToken, cfg.VisibilityTimeoutSeconds, stopLeaseExtender)
+	defer close(stopLeaseExtender)
 
 	tmpDir, err := os.MkdirTemp("", "video-job-*")
 	if err != nil {
@@ -252,7 +305,7 @@ func handleMessage(ctx context.Context, cfg Config, db *sql.DB, s3Client *s3.Cli
 		return fmt.Errorf("upload thumbnail: %w", err)
 	}
 
-	if err := markCompleted(ctx, db, jm.JobID, masterS3Key, jm.ThumbnailS3Key); err != nil {
+	if err := markCompleted(ctx, db, jm.JobID, claimToken, masterS3Key, jm.ThumbnailS3Key); err != nil {
 		return fmt.Errorf("mark completed: %w", err)
 	}
 
@@ -419,29 +472,95 @@ func currentJobStatus(ctx context.Context, db *sql.DB, jobID string) (string, er
 	return status, err
 }
 
-func markProcessing(ctx context.Context, db *sql.DB, jobID string) error {
-	_, err := db.ExecContext(ctx,
-		`update video_jobs set status='PROCESSING', error_message=null, updated_at=now() where id=$1 and status <> 'COMPLETED'`,
-		jobID,
-	)
-	return err
-}
-
-func markCompleted(ctx context.Context, db *sql.DB, jobID, outputKey, thumbnailKey string) error {
-	_, err := db.ExecContext(ctx,
+func claimJob(ctx context.Context, db sqlExecer, jobID, workerID, claimToken string, leaseSeconds int32) (bool, error) {
+	result, err := db.ExecContext(ctx,
 		`update video_jobs
-		 set status='COMPLETED',
-		     output_s3_key=$2,
-		     thumbnail_s3_key=$3,
+		 set status='PROCESSING',
+		     worker_id=$2,
+		     claim_token=$3,
+		     lease_expires_at=now() + ($4::integer * interval '1 second'),
 		     error_message=null,
 		     updated_at=now()
-		 where id=$1`,
-		jobID, outputKey, thumbnailKey,
+		 where id=$1
+		   and (
+		     status='QUEUED'
+		     or (
+		       status='PROCESSING'
+		       and (lease_expires_at is null or lease_expires_at <= now())
+		     )
+		   )`,
+		jobID, workerID, claimToken, leaseSeconds,
 	)
-	return err
+	if err != nil {
+		return false, err
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows == 1, nil
+}
+
+func markCompleted(ctx context.Context, db *sql.DB, jobID, claimToken, outputKey, thumbnailKey string) error {
+	result, err := db.ExecContext(ctx,
+		`update video_jobs
+		 set status='COMPLETED',
+		     output_s3_key=$3,
+		     thumbnail_s3_key=$4,
+		     error_message=null,
+		     worker_id=null,
+		     claim_token=null,
+		     lease_expires_at=null,
+		     updated_at=now()
+		 where id=$1 and status='PROCESSING' and claim_token=$2`,
+		jobID, claimToken, outputKey, thumbnailKey,
+	)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return fmt.Errorf("job claim was lost before completion")
+	}
+	return nil
 }
 
 func markFailedFromMessage(ctx context.Context, db *sql.DB, fallbackBucket, body string, cause error) bool {
+	var claimed claimedJobError
+	if errors.As(cause, &claimed) {
+		result, err := db.ExecContext(ctx,
+			`update video_jobs
+			 set status='FAILED',
+			     error_message=$3,
+			     worker_id=null,
+			     claim_token=null,
+			     lease_expires_at=null,
+			     updated_at=now()
+			 where id=$1 and status='PROCESSING' and claim_token=$2`,
+			claimed.jobID,
+			claimed.claimToken,
+			truncate(cause.Error(), 1900),
+		)
+		if err != nil {
+			log.Printf("mark failed job_id=%s: %v", claimed.jobID, err)
+			return false
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			log.Printf("read mark failed result job_id=%s: %v", claimed.jobID, err)
+			return false
+		}
+		if rows != 1 {
+			log.Printf("not marking failed because job claim was lost job_id=%s", claimed.jobID)
+			return false
+		}
+		return true
+	}
+
 	jm, err := jobMessageFromSQSBody(body, fallbackBucket)
 	if err != nil || jm.JobID == "" {
 		return true
@@ -761,6 +880,66 @@ func extendMessageVisibility(ctx context.Context, client *sqs.Client, queueURL, 
 			}
 		}
 	}
+}
+
+func extendJobLease(ctx context.Context, db *sql.DB, jobID, claimToken string, leaseSeconds int32, stop <-chan struct{}) {
+	interval := time.Duration(leaseSeconds) * time.Second / 2
+	if interval < 30*time.Second {
+		interval = 30 * time.Second
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-stop:
+			return
+		case <-ticker.C:
+			result, err := db.ExecContext(ctx,
+				`update video_jobs
+				 set lease_expires_at=now() + ($3::integer * interval '1 second'),
+				     updated_at=now()
+				 where id=$1 and status='PROCESSING' and claim_token=$2`,
+				jobID, claimToken, leaseSeconds,
+			)
+			if err != nil {
+				log.Printf("extend job lease job_id=%s: %v", jobID, err)
+				continue
+			}
+			rows, err := result.RowsAffected()
+			if err != nil {
+				log.Printf("read job lease update result job_id=%s: %v", jobID, err)
+				continue
+			}
+			if rows != 1 {
+				log.Printf("job lease lost job_id=%s", jobID)
+				return
+			}
+		}
+	}
+}
+
+func newClaimToken() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func defaultWorkerID() string {
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		hostname = "worker"
+	}
+	token, err := newClaimToken()
+	if err != nil {
+		token = strconv.FormatInt(time.Now().UnixNano(), 10)
+	}
+	return fmt.Sprintf("%s:%d:%s", hostname, os.Getpid(), token)
 }
 
 func deleteMessage(ctx context.Context, client *sqs.Client, queueURL, receiptHandle string) error {
