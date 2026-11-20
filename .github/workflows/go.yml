@@ -16,7 +16,7 @@ jobs:
     name: Analyse code base
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Init codeql
         uses: github/codeql-action/init@v4
         with:
@@ -28,7 +28,7 @@ jobs:
     name: Build project
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Set up Go
       uses: actions/setup-go@v7
