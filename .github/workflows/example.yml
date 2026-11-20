@@ -1,0 +1,16 @@
+name: Example
+on:
+  label:
+    types:
+      - created
+  push:
+    branches:
+      - main
+  page_build: 
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: print event
+        run: echo 'The event that triggered the workflow is ${{ github.event_name }}'
