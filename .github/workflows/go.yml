@@ -7,13 +7,23 @@ on:
   push:
     branches: [ "main" ]
   pull_request:
-    branches: [ "main" ]
-  schedule:
-    - cron: '*/5 * * * *' 
+    branches: [ "main" ] 
 
 jobs:
+  analyse:
+    name: Analyse code base
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init codeql
+        uses: github/codql-action/init@v4
+        with:
+          languages: go
+      - name: Analyse code
+        uses: github/codeql-action/analyze@v4
 
   build:
+    name: Build project
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
