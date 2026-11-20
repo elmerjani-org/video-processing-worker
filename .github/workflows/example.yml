@@ -13,4 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: print event
-        run: echo 'The event that triggered the workflow is ${{ github.event_name }}'
+        run: |
+          echo 'The event that triggered the workflow is ${{ github.event_name }}'
+          echo 'GITHUB_SHA $GITHUB_SHA'
+          echo 'GITHUB_REPOSITORY $GITHUB_REPOSITORY'
+          echo 'github.repository ${{ github.repository }}
