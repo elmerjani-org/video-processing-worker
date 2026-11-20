@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Init codeql
-        uses: github/codql-action/init@v4
+        uses: github/codeql-action/init@v4
         with:
           languages: go
       - name: Analyse code
