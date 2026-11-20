@@ -15,6 +15,5 @@ jobs:
       - name: print event
         run: |
           echo 'The event that triggered the workflow is ${{ github.event_name }}'
-          echo 'GITHUB_SHA $GITHUB_SHA'
-          echo 'GITHUB_REPOSITORY $GITHUB_REPOSITORY'
-          echo 'github.repository ${{ github.repository }}
+          echo 'GITHUB_SHA ${{ github.sha }}'
+          echo 'github.repository ${{ github.repository }}'
