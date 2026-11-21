@@ -8,12 +8,19 @@ on:
       - main
   page_build: 
 
+env:
+  WORKFLOW_ENV: this env is workflow level
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      JOB_ENV: this env is job level
     steps:
       - name: print event
         run: |
           echo 'The event that triggered the workflow is ${{ github.event_name }}'
           echo 'GITHUB_SHA ${{ github.sha }}'
           echo 'github.repository ${{ github.repository }}'
+          echo 'workflow: ${{ env.WORKFLOW_ENV }}'
+          echo 'job: ${{ env.JOB_ENV }}'
