@@ -1,0 +1,15 @@
+name: Handle CI Failure
+on:
+  workflow_run:
+    workflows: ['*']
+    types: [completed]
+
+jobs:
+  handle-failure:
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: handle failure
+        run: echo 'failure on workflow ${{ github.event.workflow.url }}'
+    
