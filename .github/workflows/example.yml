@@ -6,6 +6,9 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
   page_build: 
 
 env:
@@ -17,6 +20,14 @@ jobs:
     env:
       JOB_ENV: this env is job level
     steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository }}
+          token: ${{ github.token }}
+          ref: ${{ github.ref_name }}
+          
+          
+          
       - name: print event
         run: |
           echo 'The event that triggered the workflow is ${{ github.event_name }}'
@@ -24,3 +35,6 @@ jobs:
           echo 'github.repository ${{ github.repository }}'
           echo 'workflow: ${{ env.WORKFLOW_ENV }}'
           echo 'job: ${{ env.JOB_ENV }}'
+      - name: Scanning code
+        uses: trufflesecurity/trufflehog@v3.100.1
+          
