@@ -41,7 +41,7 @@ jobs:
         if: failure()
         uses: octokit/request-action@v2.1.0
         with:
-          route: POST repos/${{ github.repository }}/issues
+          route: POST /repos/${{ github.repository }}/issues
           title: "Test failed: ${{ github.ref }}"
           body: "A test failes. Please check."
         env:
