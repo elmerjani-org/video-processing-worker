@@ -25,9 +25,6 @@ jobs:
           repository: ${{ github.repository }}
           token: ${{ github.token }}
           ref: ${{ github.ref_name }}
-          
-          
-          
       - name: print event
         run: |
           echo 'The event that triggered the workflow is ${{ github.event_name }}'
@@ -37,4 +34,15 @@ jobs:
           echo 'job: ${{ env.JOB_ENV }}'
       - name: Scanning code
         uses: trufflesecurity/trufflehog@v3.100.1
+      - name: Create issue on failure
+        if: failure()
+        uses: octokit/request-action@v2.1.0
+        with:
+          route: POST repos/${{ github.repository }}/issues
+          title: "Test failed: ${{ github.ref }}"
+          body: "A test failes. Please check."
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          
+          
           
