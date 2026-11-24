@@ -1,0 +1,17 @@
+name: Workflow commands
+
+on: 
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: [ubuntu-latest]
+
+    steps:
+      - name: Create annotations for buil errors
+        run: echo "::error file=app.js,line=1::Missing semicolon"
