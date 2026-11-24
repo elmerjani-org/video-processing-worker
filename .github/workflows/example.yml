@@ -31,7 +31,7 @@ jobs:
           echo 'GITHUB_SHA ${{ github.sha }}'
           echo 'github.repository ${{ github.repository }}'
           echo 'workflow: ${{ env.WORKFLOW_ENV }}'
-          echo 'job: ${{ env.JOB_ENV }}'
+          exit 1
       - name: Scanning code
         uses: trufflesecurity/trufflehog@v3.100.1
       - name: Create issue on failure
