@@ -1,21 +1,23 @@
-name: Self hosted runner test
-on:
+on: 
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
-    branches:
-      - main
-
+    branches: [main]
+    
 jobs:
   test:
-    runs-on:
-      - self-hosted
-      - Linux
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
+    runs-on: self-hosted
 
-      - name: Print repo
+    steps:
+      - name: Test runner
         run: |
-          echo "Repository: ${{ github.repository }}"
+          echo "Hello from my AWS runner"
+          hostname
+          whoami
+          pwd
+
+      - name: Check system resources
+        run: |
+          free -h
+          df -h
+          nproc
