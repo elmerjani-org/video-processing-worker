@@ -14,5 +14,14 @@ jobs:
     runs-on: [ubuntu-latest]
 
     steps:
-      - name: Create annotations for buil errors
-        run: echo "::error file=app.js,line=1::Missing semicolon"
+      - name: Normal log
+        run: echo "This is a normal log"
+
+      - name: Notice annotation
+        run: echo "::notice::AWS runner is working"
+
+      - name: Warning annotation
+        run: echo "::warning::High CPU usage detected"
+
+      - name: Error annotation
+        run: echo "::error file=main.go,line=10::Example compilation error"
