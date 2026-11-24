@@ -1,23 +1,87 @@
+name: Go - AWS Runner Stress Test
 on: 
   push:
     branches: [main]
   pull_request:
     branches: [main]
     
+permissions:
+  contents: read
+
 jobs:
-  test:
-    runs-on: self-hosted
-
+  stress-test:
+    runs-on: [self-hosted, Linux, X64]
     steps:
-      - name: Test runner
-        run: |
-          echo "Hello from my AWS runner"
-          hostname
-          whoami
-          pwd
+      - name: Checkout repository
+        uses: actions/checkout@v7
 
-      - name: Check system resources
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: System information
+        run: |
+          echo "Hostname: $(hostname)"
+          echo "User: $(whoami)"
+          echo "CPU cores: $(nproc)"
+          free -h
+          df -h
+          go version
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Build application
+        run: go build -v ./...
+
+      - name: Static analysis
+        run: go vet ./...
+
+      - name: Run tests
+        run: go test -v ./...
+
+      - name: Run race detection
+        run: go test -race ./...
+
+      - name: Generate test coverage
+        run: |
+          go test -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out
+
+      - name: Sustained compilation workload
+        run: |
+          END=$((SECONDS + 600))
+          ITERATION=0
+
+          while [ "$SECONDS" -lt "$END" ]; do
+            ITERATION=$((ITERATION + 1))
+
+            echo "Build iteration: $ITERATION"
+            echo "Timestamp: $(date)"
+
+            go build -a ./...
+
+            free -h
+            uptime
+
+            echo "Iteration completed"
+            sleep 5
+          done
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.out
+
+      - name: Final system information
+        if: always()
         run: |
           free -h
           df -h
-          nproc
+          uptime
