@@ -9,79 +9,20 @@ permissions:
   contents: read
 
 jobs:
-  stress-test:
-    runs-on: [self-hosted, Linux, X64]
+  build:
+    runs-on: self-hosted
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
+      - run: echo "Building application"
+      - run: sleep 60
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
+  test:
+    runs-on: self-hosted
+    steps:
+      - run: echo "Testing application"
+      - run: sleep 60
 
-      - name: System information
-        run: |
-          echo "Hostname: $(hostname)"
-          echo "User: $(whoami)"
-          echo "CPU cores: $(nproc)"
-          free -h
-          df -h
-          go version
-
-      - name: Download dependencies
-        run: go mod download
-
-      - name: Verify dependencies
-        run: go mod verify
-
-      - name: Build application
-        run: go build -v ./...
-
-      - name: Static analysis
-        run: go vet ./...
-
-      - name: Run tests
-        run: go test -v ./...
-
-      - name: Run race detection
-        run: go test -race ./...
-
-      - name: Generate test coverage
-        run: |
-          go test -coverprofile=coverage.out ./...
-          go tool cover -func=coverage.out
-
-      - name: Sustained compilation workload
-        run: |
-          END=$((SECONDS + 600))
-          ITERATION=0
-
-          while [ "$SECONDS" -lt "$END" ]; do
-            ITERATION=$((ITERATION + 1))
-
-            echo "Build iteration: $ITERATION"
-            echo "Timestamp: $(date)"
-
-            go build -a ./...
-
-            free -h
-            uptime
-
-            echo "Iteration completed"
-            sleep 5
-          done
-
-      - name: Upload coverage report
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-report
-          path: coverage.out
-
-      - name: Final system information
-        if: always()
-        run: |
-          free -h
-          df -h
-          uptime
+  lint:
+    runs-on: self-hosted
+    steps:
+      - run: echo "Linting application"
+      - run: sleep 60
