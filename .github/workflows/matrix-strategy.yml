@@ -19,7 +19,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@7
+        uses: actions/checkout@v7
 
       - name: Print matrix values
         run: |
