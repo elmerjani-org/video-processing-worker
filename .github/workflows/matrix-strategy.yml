@@ -1,0 +1,27 @@
+name: Matrix strategy 
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        version: [8, 17, 21]
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@7
+
+      - name: Print matrix values
+        run: |
+          echo "::debug::OS is ${{ matrix.os }}"
+          echo "::debug::Version is ${{ matrix.version }}"
