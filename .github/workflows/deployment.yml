@@ -17,26 +17,14 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Setup Go
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-
-      - name: Run tests
-        run: go test ./...
-
-      - name: Build
-        run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-            go build -o bin/app .
+      
 
       - name: Authenticate to AWS
-        uses: aws-actions/configure-aws-credentials@v6
+        uses: aws-actions/configure-aws-credentials@v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Publish binary
-        run: aws s3 cp bin/app s3://${{ secrets.AWS_BUCKET_NAME }}/app
+      - name: Test authentication
+        run: aws sts get-caller-identity
+        
