@@ -39,7 +39,7 @@ jobs:
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Publish binary
-        run: aws s3 cp bin/app s3://my-app-bucket/app
+        run: aws s3 cp bin/app s3://${{ secrets.AWS_BUCKET_NAME }}/app
         
       
         
