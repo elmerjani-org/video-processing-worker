@@ -13,11 +13,20 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  delivery:
+  create-latest-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Update tag
+        run: |
+          git tag -f latest ${{ github.sha }}
+          git push origin refs/tags/latest
+  create-version-tag:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
