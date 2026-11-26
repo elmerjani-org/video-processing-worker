@@ -12,11 +12,14 @@ on:
 jobs:
   build:
     runs-on: [ubuntu-latest]
+    outputs:
+      OUTPUT_1: ${{ steps.step1.outputs.test }}
+      OUTPUT_2: ${{ steps.step2.outputs.test }}
 
     steps:
       - name: Normal log
         run: echo "This is a normal log"
-
+        
       - name: Notice annotation
         run: echo "::notice::AWS runner is working"
 
@@ -25,3 +28,19 @@ jobs:
 
       - name: Error annotation
         run: echo "::error file=main.go,line=10::Example compilation error"
+
+      - id: step1
+        run: echo "test=hello" >> "$GITHUB_OUTPUT"
+
+      - id: step2
+        run: echo "test=workd" >> "$GITHUB_OUTPUT"
+
+  print-output:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - env:
+          OUTPUT_1: ${{ needs.build.outputs.OUTPUT_1 }}
+          OUTPUT_2: ${{ needs.build.outputs.OUTPUT_2 }}
+        run: echo "$OUTPUT_1 $OUTPUT2"
+        
